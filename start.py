@@ -17,7 +17,11 @@ from socket import (AF_INET, IP_HDRINCL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, S
 from ssl import CERT_NONE, SSLContext, create_default_context
 import ssl
 from struct import pack as data_pack
+from shutil import copytree, rmtree
 from subprocess import run, PIPE
+from tempfile import mkdtemp
+from zipfile import ZipFile
+import sys
 from sys import argv
 from sys import exit as _exit
 from threading import Event, Lock, Thread
@@ -1696,7 +1700,9 @@ class ProxyManager:
 
 
 class ToolsConsole:
-    METHODS = {"INFO", "TSSRV", "CFIP", "DNS", "PING", "CHECK", "DSTAT"}
+    METHODS = {"INFO", "TSSRV", "CFIP", "DNS", "PING", "CHECK", "DSTAT", "UPDATE"}
+    GITHUB_REPO = "https://github.com/YncTeam/MHDDoS"
+    GITHUB_ZIP = GITHUB_REPO + "/archive/refs/heads/master.zip"
 
     @staticmethod
     def checkRawSocket():
@@ -1856,6 +1862,69 @@ class ToolsConsole:
                                  "ONLINE" if r.is_alive else "OFFLINE"))
 
     @staticmethod
+    def update():
+        logger.info(
+            f"{bcolors.WARNING}Updating MHDDoS from GitHub...{bcolors.RESET}")
+        tmp = Path(mkdtemp(prefix="mhddos_update_"))
+        zip_path = tmp / "master.zip"
+        try:
+            # Download latest code
+            r = get(ToolsConsole.GITHUB_ZIP, stream=True, timeout=30)
+            r.raise_for_status()
+            with zip_path.open("wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            # Extract
+            extract_dir = tmp / "extracted"
+            extract_dir.mkdir()
+            with ZipFile(zip_path) as z:
+                z.extractall(extract_dir)
+
+            # Find the repo root inside the zip
+            repo_dirs = [d for d in extract_dir.iterdir() if d.is_dir()]
+            if not repo_dirs:
+                raise Exception("No directory found in zip")
+            src = repo_dirs[0]
+
+            # Copy files (skip proxies and tmp)
+            exclude = {"files/proxies", "__pycache__", ".git"}
+            for item in src.iterdir():
+                if item.name in exclude:
+                    continue
+                dst = __dir__ / item.name
+                if dst.exists():
+                    if dst.is_dir():
+                        rmtree(dst)
+                    else:
+                        dst.unlink()
+                if item.is_dir():
+                    copytree(item, dst)
+                else:
+                    with item.open("rb") as fin:
+                        with dst.open("wb") as fout:
+                            fout.write(fin.read())
+
+            # Reinstall requirements
+            req = __dir__ / "requirements.txt"
+            if req.exists():
+                logger.info(f"{bcolors.WARNING}Installing requirements...{bcolors.RESET}")
+                run([sys.executable, "-m", "pip", "install", "-r", str(req), "--quiet"],
+                    capture_output=True)
+
+            logger.info(
+                f"{bcolors.OKGREEN}Update complete!{bcolors.RESET}")
+
+        except Exception as e:
+            logger.error(
+                f"{bcolors.FAIL}Update failed: {e}{bcolors.RESET}")
+        finally:
+            rmtree(tmp, ignore_errors=True)
+
+        # Restart with same args
+        os.execl(sys.executable, sys.executable, *sys.argv)
+
+    @staticmethod
     def stop():
         print('All Attacks has been Stopped !')
         for proc in process_iter():
@@ -2007,6 +2076,8 @@ if __name__ == '__main__':
                 ToolsConsole.runConsole()
             if one == "STOP":
                 ToolsConsole.stop()
+            if one == "UPDATE":
+                ToolsConsole.update()
 
             method = one
             host = None
