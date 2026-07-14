@@ -100,7 +100,7 @@ with open(__dir__ / "config.json") as f:
     con = load(f)
 
 # Proxy checker configuration
-PROXY_CHECK_TIMEOUT: int = 5
+PROXY_CHECK_TIMEOUT: int = 10
 PROXY_CHECK_MAX_CONCURRENT: int = 2000
 PROXY_MIN_VERIFIED: int = 300
 PROXY_CACHE_TTL: int = 180
@@ -2039,7 +2039,9 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None):
 
 
 if __name__ == '__main__':
-    with suppress(KeyboardInterrupt):
+    event = Event()
+    event.clear()
+    try:
         with suppress(IndexError):
             one = argv[1].upper()
 
@@ -2056,8 +2058,6 @@ if __name__ == '__main__':
             host = None
             port = None
             url = None
-            event = Event()
-            event.clear()
             target = None
             urlraw = argv[2].strip()
             if not urlraw.startswith("http"):
@@ -2222,3 +2222,10 @@ if __name__ == '__main__':
             exit()
 
         ToolsConsole.usage()
+    except KeyboardInterrupt:
+        event.clear()
+        _killer_pool.shutdown(wait=False)
+        exit("Interrupted by user")
+    finally:
+        event.clear()
+        _killer_pool.shutdown(wait=False)
