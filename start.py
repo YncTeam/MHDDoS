@@ -1609,41 +1609,70 @@ def _check_proxies_fast(proxies: Collection[Proxy], url: str) -> Set[Proxy]:
     lock = Lock()
     min_ok = min(PROXY_MIN_VERIFIED, total)
     target = URL(url)
-    host = target.host.encode()
-    port = target.port or 80
-    http_get = b"GET / HTTP/1.0\r\nHost: " + host + b"\r\nConnection: close\r\n\r\n"
+    t_host = target.host
+    t_port = target.port or 80
+    t_host_b = t_host.encode()
+    t_auth = ("%s:%d" % (t_host, t_port)).encode()
+    # Realistic request matching actual attack traffic
+    req_base = b"GET / HTTP/1.1\r\nHost: " + t_host_b + b"\r\nConnection: keep-alive\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n"
+    req_tunnel = req_base + b"\r\n"
+    req_forward = b"GET http://" + t_auth + b"/ HTTP/1.1\r\nHost: " + t_host_b + b"\r\nConnection: keep-alive\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n"
+
+    def _check_connect(proxy: Proxy) -> bool:
+        try:
+            with proxy.open_socket() as sock:
+                sock.settimeout(PROXY_CHECK_TIMEOUT)
+                sock.connect((t_host, t_port))
+                sock.sendall(req_tunnel)
+                for _ in range(3):
+                    try:
+                        chunk = sock.recv(256)
+                        if b"HTTP/" in chunk:
+                            return True
+                        if chunk == b"":
+                            break
+                    except:
+                        break
+        except Exception:
+            pass
+        return False
+
+    def _check_forward(proxy: Proxy) -> bool:
+        try:
+            with socket(AF_INET, SOCK_STREAM) as sock:
+                sock.settimeout(PROXY_CHECK_TIMEOUT)
+                sock.connect((proxy.host, proxy.port))
+                sock.sendall(req_forward)
+                for _ in range(3):
+                    try:
+                        chunk = sock.recv(256)
+                        if b"HTTP/" in chunk or b"200" in chunk[:16]:
+                            return True
+                        if chunk == b"":
+                            break
+                    except:
+                        break
+        except Exception:
+            pass
+        return False
 
     def _check_one(proxy: Proxy) -> None:
         nonlocal checked
-        ok = False
-        for attempt in range(2):
-            try:
-                with proxy.open_socket() as sock:
-                    sock.settimeout(PROXY_CHECK_TIMEOUT)
-                    sock.connect((target.host, port))
-                    sock.send(http_get)
-                    resp = sock.recv(128)
-                    if resp.startswith(b"HTTP/"):
-                        ok = True
-                        break
-            except Exception:
-                if attempt == 0:
-                    continue
+        ok = _check_connect(proxy)
+        if not ok and proxy.type == ProxyType.HTTP:
+            ok = _check_forward(proxy)
         with lock:
             checked += 1
             if ok:
                 verified.add(proxy)
-                print(f"\r  [{checked}/{total}] \033[92m\u2713 {proxy.host}:{proxy.port}\033[0m          ", end="", flush=True)
-            elif checked % 25 == 0:
-                print(f"\r  [{checked}/{total}] \033[92m{len(verified)} ok\033[0m, \033[91m{checked - len(verified)} failed\033[0m    ", end="", flush=True)
+            if checked % 30 == 0 or checked == total or ok:
+                print(f"\r  [{checked}/{total}] \033[92m{len(verified)} ok\033[0m, \033[91m{checked - len(verified)} failed\033[0m     ", end="", flush=True)
 
     n_workers = min(PROXY_CHECK_MAX_CONCURRENT, total)
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_check_one, p): p for p in proxies}
         for future in as_completed(futures):
             if len(verified) >= min_ok:
-                for f in futures:
-                    f.cancel()
                 break
 
     print(f"\r  [{total}/{total}] \033[92m{len(verified)} ok\033[0m, \033[91m{total - len(verified)} failed\033[0m          ")
