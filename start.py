@@ -1626,20 +1626,31 @@ def _killer_t3_build_syn(dst_ip: str, dst_port: int) -> bytes:
 
 async def _check_proxies_fast(proxies: Collection[Proxy], url: str) -> Set[Proxy]:
     verified: Set[Proxy] = set()
+    total = len(proxies)
+    checked = 0
+    failed = 0
     sem = asyncio.Semaphore(PROXY_CHECK_MAX_CONCURRENT)
     lock = asyncio.Lock()
 
     async def _check_one(proxy: Proxy) -> None:
+        nonlocal checked, failed
         async with sem:
+            ok = False
             try:
                 ok = await asyncio.wait_for(
                     asyncio.to_thread(proxy.check, url, PROXY_CHECK_TIMEOUT),
                     timeout=PROXY_CHECK_TIMEOUT + 0.5)
-                if ok:
-                    async with lock:
-                        verified.add(proxy)
             except Exception:
                 pass
+            async with lock:
+                checked += 1
+                if ok:
+                    verified.add(proxy)
+                    print(f"\r  [{checked}/{total}] \033[92m\u2713 {proxy.host}:{proxy.port}\033[0m          ", end="", flush=True)
+                else:
+                    failed += 1
+                    if checked % 50 == 0 or checked == total:
+                        print(f"\r  [{checked}/{total}] \033[91m{checked - len(verified)} failed\033[0m, \033[92m{len(verified)} ok\033[0m    ", end="", flush=True)
 
     tasks = [asyncio.create_task(_check_one(p)) for p in proxies]
     pending = set(tasks)
@@ -1653,6 +1664,7 @@ async def _check_proxies_fast(proxies: Collection[Proxy], url: str) -> Set[Proxy
     for t in tasks:
         if not t.done():
             t.cancel()
+    print(f"\r  [{total}/{total}] \033[92m{len(verified)} ok\033[0m, \033[91m{failed} failed\033[0m          ")
     return verified
 
 
