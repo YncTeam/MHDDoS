@@ -22,7 +22,7 @@ from sys import argv
 from sys import exit as _exit
 from threading import Event, Lock, Thread
 from time import sleep, time
-from typing import Any, List, Set, Tuple
+from typing import Any, Collection, List, Set, Tuple
 from urllib import parse
 from uuid import UUID, uuid4
 
@@ -48,14 +48,9 @@ logger.setLevel("INFO")
 ctx: SSLContext = create_default_context(cafile=where())
 ctx.check_hostname = False
 ctx.verify_mode = CERT_NONE
-# Enforce only TLSv1.2+ (defense-in-depth: also disable older protocols explicitly)
+# Enforce TLSv1.2+ minimum (replaces deprecated OP_NO_TLSv* flags)
 if hasattr(ctx, "minimum_version") and hasattr(ssl, "TLSVersion"):
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-# Disable insecure TLS versions for additional safety
-if hasattr(ssl, "OP_NO_TLSv1"):
-    ctx.options |= ssl.OP_NO_TLSv1
-if hasattr(ssl, "OP_NO_TLSv1_1"):
-    ctx.options |= ssl.OP_NO_TLSv1_1
 
 __version__: str = "2.4 SNAPSHOT"
 __dir__: Path = Path(__file__).parent
