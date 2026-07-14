@@ -1608,10 +1608,27 @@ def _check_proxies_fast(proxies: Collection[Proxy], url: str) -> Set[Proxy]:
     checked = 0
     lock = Lock()
     min_ok = min(PROXY_MIN_VERIFIED, total)
+    target = URL(url)
+    host = target.host.encode()
+    port = target.port or 80
+    http_get = b"GET / HTTP/1.0\r\nHost: " + host + b"\r\nConnection: close\r\n\r\n"
 
     def _check_one(proxy: Proxy) -> None:
         nonlocal checked
-        ok = proxy.check(url, PROXY_CHECK_TIMEOUT)
+        ok = False
+        for attempt in range(2):
+            try:
+                with proxy.open_socket() as sock:
+                    sock.settimeout(PROXY_CHECK_TIMEOUT)
+                    sock.connect((target.host, port))
+                    sock.send(http_get)
+                    resp = sock.recv(128)
+                    if resp.startswith(b"HTTP/"):
+                        ok = True
+                        break
+            except Exception:
+                if attempt == 0:
+                    continue
         with lock:
             checked += 1
             if ok:
@@ -1840,65 +1857,132 @@ class ToolsConsole:
 
     @staticmethod
     def update():
-        logger.info(
-            f"{bcolors.WARNING}Updating MHDDoS from GitHub...{bcolors.RESET}")
+        logger.info(f"{bcolors.WARNING}Checking for updates...{bcolors.RESET}")
+
+        # Strategy 1: Use git pull if available
+        git_dir = __dir__ / ".git"
+        if git_dir.exists():
+            try:
+                result = run(["git", "pull"], cwd=__dir__, capture_output=True, text=True, timeout=30)
+                if result.returncode == 0:
+                    logger.info(f"{bcolors.OKGREEN}Git pull successful{bcolors.RESET}")
+                    ToolsConsole._update_finish()
+                    return
+                logger.warning(f"Git pull failed: {result.stderr.strip()}")
+            except Exception as e:
+                logger.warning(f"Git not available: {e}")
+
+        # Strategy 2: Download zip and replace files
+        logger.info(f"{bcolors.WARNING}Downloading latest version from GitHub...{bcolors.RESET}")
         tmp = Path(mkdtemp(prefix="mhddos_update_"))
         zip_path = tmp / "master.zip"
+        backup_dir = __dir__ / ".backup"
         try:
-            # Download latest code
             r = get(ToolsConsole.GITHUB_ZIP, stream=True, timeout=30)
             r.raise_for_status()
             with zip_path.open("wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-            # Extract
             extract_dir = tmp / "extracted"
             extract_dir.mkdir()
             with ZipFile(zip_path) as z:
                 z.extractall(extract_dir)
 
-            # Find the repo root inside the zip
             repo_dirs = [d for d in extract_dir.iterdir() if d.is_dir()]
             if not repo_dirs:
                 raise Exception("No directory found in zip")
             src = repo_dirs[0]
 
-            # Copy files (skip proxies and tmp)
-            exclude = {"files/proxies", "__pycache__", ".git"}
+            # Backup current files
+            if backup_dir.exists():
+                rmtree(backup_dir, ignore_errors=True)
+            backup_dir.mkdir()
+
+            exclude_backup = {"files/proxies", ".backup", "__pycache__", ".git"}
+            for item in __dir__.iterdir():
+                if item.name in exclude_backup or item.name.startswith("."):
+                    continue
+                dst = backup_dir / item.name
+                try:
+                    if item.is_dir():
+                        copytree(item, dst)
+                    else:
+                        with item.open("rb") as f:
+                            with dst.open("wb") as fw:
+                                fw.write(f.read())
+                except Exception:
+                    pass
+
+            # Copy new files (skip proxies and cache)
+            skip = {"files/proxies", "__pycache__", ".git", ".backup"}
+            errors = []
             for item in src.iterdir():
-                if item.name in exclude:
+                if item.name in skip:
                     continue
                 dst = __dir__ / item.name
-                if dst.exists():
-                    if dst.is_dir():
-                        rmtree(dst)
+                try:
+                    if dst.exists():
+                        if dst.is_dir():
+                            rmtree(dst, ignore_errors=True)
+                        else:
+                            dst.unlink()
+                    if item.is_dir():
+                        copytree(item, dst)
                     else:
-                        dst.unlink()
-                if item.is_dir():
-                    copytree(item, dst)
-                else:
-                    with item.open("rb") as fin:
-                        with dst.open("wb") as fout:
-                            fout.write(fin.read())
+                        with item.open("rb") as f:
+                            with dst.open("wb") as fw:
+                                fw.write(f.read())
+                except Exception as e:
+                    errors.append(f"{item.name}: {e}")
 
-            # Reinstall requirements
+            if errors:
+                logger.warning(f"{bcolors.WARNING}Some files could not be replaced:{bcolors.RESET}")
+                for e in errors:
+                    logger.warning(f"  {e}")
+                logger.info(f"{bcolors.WARNING}Backup saved at: {backup_dir}{bcolors.RESET}")
+
+            # Install requirements
             req = __dir__ / "requirements.txt"
             if req.exists():
                 logger.info(f"{bcolors.WARNING}Installing requirements...{bcolors.RESET}")
                 run([sys.executable, "-m", "pip", "install", "-r", str(req), "--quiet"],
-                    capture_output=True)
+                    capture_output=False)
 
-            logger.info(
-                f"{bcolors.OKGREEN}Update complete!{bcolors.RESET}")
+            logger.info(f"{bcolors.OKGREEN}Update complete!{bcolors.RESET}")
 
         except Exception as e:
-            logger.error(
-                f"{bcolors.FAIL}Update failed: {e}{bcolors.RESET}")
+            logger.error(f"{bcolors.FAIL}Update failed: {e}{bcolors.RESET}")
+            # Restore from backup if it exists
+            if backup_dir.exists():
+                logger.info(f"{bcolors.WARNING}Restoring from backup...{bcolors.RESET}")
+                for item in backup_dir.iterdir():
+                    dst = __dir__ / item.name
+                    try:
+                        if dst.exists():
+                            if dst.is_dir():
+                                rmtree(dst, ignore_errors=True)
+                            else:
+                                dst.unlink()
+                        if item.is_dir():
+                            copytree(item, dst)
+                        else:
+                            with item.open("rb") as f:
+                                with dst.open("wb") as fw:
+                                    fw.write(f.read())
+                    except Exception:
+                        pass
+                rmtree(backup_dir, ignore_errors=True)
         finally:
             rmtree(tmp, ignore_errors=True)
 
+        ToolsConsole._update_finish()
+
+    @staticmethod
+    def _update_finish():
         # Restart with same args
+        logger.info(f"{bcolors.WARNING}Restarting...{bcolors.RESET}")
+        logging.shutdown()
         os.execl(sys.executable, sys.executable, *sys.argv)
 
     @staticmethod
