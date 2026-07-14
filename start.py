@@ -1982,7 +1982,7 @@ class ToolsConsole:
     def _update_finish():
         # Restart with same args
         logger.info(f"{bcolors.WARNING}Restarting...{bcolors.RESET}")
-        logging.shutdown()
+        shutdown()
         os.execl(sys.executable, sys.executable, *sys.argv)
 
     @staticmethod
