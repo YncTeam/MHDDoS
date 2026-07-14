@@ -1,4 +1,67 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+wheels/
+*.whl
+MANIFEST
+
+# ── Virtual environments ────────────────────────────────
 venv
+.venv
+env/
+.env
+ENV/
+env.bak/
+venv.bak/
+
+# ── IDE / Editor ────────────────────────────────────────
 /.idea/
-files/proxies/*
+*.iml
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+*.vscode
+
+# ── OS files ────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── Project-specific ───────────────────────────────────
+files/proxies/*
+files/proxies/
+config.json
+config.local.json
+
+# ── Logs / Temp ─────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+/tmp/
+**/tmp/
+
+# ── Docker ──────────────────────────────────────────────
+.docker/
+*.tar
+*.tgz
+
+# ── Go binaries (bombardier) ───────────────────────────
+go/bin/
+go/pkg/
